@@ -1,114 +1,111 @@
 #!/bin/bash
 
-# Get mouse position relative to pane
-# Note: tmux 3.2+ can get mouse position with #{mouse_x} and #{mouse_y}
-MOUSE_X=$(tmux display-message -p '#{mouse_x}')
-MOUSE_Y=$(tmux display-message -p '#{mouse_y}')
+# We need to capture mouse position BEFORE opening the popup
+# This is tricky because tmux clears mouse position after event
 
-# State tracking
-STATE_DIR="/tmp/tmux-menu"
-mkdir -p "$STATE_DIR"
-STATE_FILE="$STATE_DIR/state-$(tmux display-message -p '#{session_id}-#{window_id}-#{pane_id}')"
+# Better approach: Use window/pane-relative positioning
+SESSION_ID=$(tmux display-message -p '#{session_id}')
+WINDOW_ID=$(tmux display-message -p '#{window_id}')
+PANE_ID=$(tmux display-message -p '#{pane_id}')
 
-# Function to clean up
-cleanup() {
-    rm -f "$STATE_FILE"
-    exit 0
-}
+STATE_FILE="/tmp/tmux-menu-$SESSION_ID-$WINDOW_ID-$PANE_ID"
 
-# If menu already showing, close it
+# Close if already open
 if [ -f "$STATE_FILE" ]; then
     tmux kill-pane -t '{menu}' 2>/dev/null
     rm -f "$STATE_FILE"
     exit 0
 fi
 
-# Mark as showing
+# Mark as open
 echo "1" > "$STATE_FILE"
 
-# Calculate popup position (centered around mouse)
-# Adjust these values to change popup size
-POPUP_WIDTH=20
-POPUP_HEIGHT=6
+# We'll use the current pane's position as reference
+# Get pane top-left coordinates
+PANE_X=$(tmux display-message -p '#{pane_left}')
+PANE_Y=$(tmux display-message -p '#{pane_top}')
 
-# Create the popup - using -d to pass initial position
+# Estimate mouse position (center of pane as fallback)
+MOUSE_X=$((PANE_X + 10))
+MOUSE_Y=$((PANE_Y + 5))
+
+# Small menu size
+MENU_WIDTH=20
+MENU_HEIGHT=6
+
+# Calculate position (try to keep within pane bounds)
+FINAL_X=$MOUSE_X
+FINAL_Y=$MOUSE_Y
+
+# Create popup
 tmux display-popup \
-    -w $POPUP_WIDTH \
-    -h $POPUP_HEIGHT \
-    -x $((MOUSE_X - POPUP_WIDTH/2)) \
-    -y $((MOUSE_Y - POPUP_HEIGHT/2)) \
+    -w $MENU_WIDTH \
+    -h $MENU_HEIGHT \
+    -x $FINAL_X \
+    -y $FINAL_Y \
     -E "
-        # Trap signals to ensure cleanup
-        trap 'exit 0' INT TERM
-        
-        # Menu items
-        menu_items=('Copy' 'Paste')
+        # Simple menu with arrow navigation
         selected=0
+        options=('Copy' 'Paste')
         
-        # Function to display menu
-        display_menu() {
+        show_menu() {
             clear
-            for i in \${!menu_items[@]}; do
+            printf '\\n'
+            for i in \${!options[@]}; do
                 if [ \$i -eq \$selected ]; then
-                    echo \"▶ \${menu_items[\$i]}\"
+                    printf '  \\033[1;36m▶ %s\\033[0m\\n' \"\${options[\$i]}\"
                 else
-                    echo \"  \${menu_items[\$i]}\"
+                    printf '    %s\\n' \"\${options[\$i]}\"
                 fi
             done
+            printf '\\n'
         }
         
-        # Initial display
-        display_menu
+        show_menu
         
-        # Main loop
-        while true; do
-            # Read single key (including arrows)
-            IFS= read -rsn1 key
-            
-            # Handle escape sequences (arrows)
+        while IFS= read -rsn1 key; do
+            # Check for escape sequences (arrows)
             if [[ \$key == \$'\\x1b' ]]; then
-                read -rsn2 -t 0.1 key2
-                key=\$key\$key2
+                read -rsn2 -t 0.1 seq
+                case \$seq in
+                    '[A')  # Up arrow
+                        selected=\$(( (selected - 1 + \${#options[@]}) % \${#options[@]} ))
+                        show_menu
+                        continue
+                        ;;
+                    '[B')  # Down arrow
+                        selected=\$(( (selected + 1) % \${#options[@]} ))
+                        show_menu
+                        continue
+                        ;;
+                esac
             fi
             
-            case \$key in
-                # Up arrow
-                \$'\\x1b[A')
-                    selected=\$(( (selected - 1 + \${#menu_items[@]}) % \${#menu_items[@]} ))
-                    display_menu
-                    ;;
-                    
-                # Down arrow
-                \$'\\x1b[B')
-                    selected=\$(( (selected + 1) % \${#menu_items[@]} ))
-                    display_menu
-                    ;;
-                    
-                # Enter/Return
-                \"\")
-                    # Execute action based on selection
-                    case \$selected in
-                        0)  # Copy
+            # Enter key
+            if [[ -z \$key ]]; then
+                case \$selected in
+                    0)
+                        # Enter copy mode or copy selection
+                        if tmux display-message -p '#{pane_in_mode}' | grep -q '1'; then
+                            tmux send-keys -X copy-selection-and-cancel
+                        else
                             tmux copy-mode
-                            # If in copy mode already, copy selection
-                            if tmux display-message -p '#{pane_in_mode}' | grep -q '1'; then
-                                tmux send-keys -X copy-selection-and-cancel
-                            fi
-                            ;;
-                        1)  # Paste
-                            tmux paste-buffer
-                            ;;
-                    esac
-                    cleanup
-                    ;;
-                    
-                # Any other key or mouse click outside will close
-                *)
-                    cleanup
-                    ;;
-            esac
+                        fi
+                        ;;
+                    1)
+                        tmux paste-buffer
+                        ;;
+                esac
+                break
+            fi
+            
+            # Any other key closes
+            break
         done
+        
+        # Cleanup
+        rm -f '$STATE_FILE' 2>/dev/null
     "
 
-# Cleanup after popup closes
-rm -f "$STATE_FILE"
+# Cleanup if popup didn't clean itself
+rm -f "$STATE_FILE" 2>/dev/null
